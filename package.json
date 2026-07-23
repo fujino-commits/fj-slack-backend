@@ -1,0 +1,17 @@
+{
+  "name": "fj-slack-backend",
+  "version": "1.0.0",
+  "description": "藤野晃司完全管理システム 受信箱機能用の軽量Slack連携バックエンド（メンション・DM取得）",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
