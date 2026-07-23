@@ -176,6 +176,11 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'fj-slack-backend' }));
+app.get('/', (req, res) => res.json({
+  status: 'ok',
+  service: 'fj-slack-backend',
+  apiTokenLength: (API_TOKEN || '').length,
+  slackUserTokenLength: (SLACK_USER_TOKEN || '').length,
+}));
 
 app.listen(PORT, () => console.log(`fj-slack-backend listening on port ${PORT}`));
