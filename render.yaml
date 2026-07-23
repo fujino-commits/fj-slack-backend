@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: fj-slack-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: API_TOKEN
+        sync: false
+      - key: SLACK_USER_TOKEN
+        sync: false
+      - key: HISTORY_PER_CHANNEL
+        value: "20"
+      - key: CACHE_TTL_MS
+        value: "30000"
