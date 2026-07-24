@@ -217,6 +217,37 @@ app.get('/messages', async (req, res) => {
   }
 });
 
+// 指定したチャンネル/DMそれぞれについて、直近の発言者が自分自身かどうかを返す
+// （「自分が最後に返信済み」のスレッドを自動で完了扱いにするための判定に使う）
+app.get('/channel-last-sender', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  if (!assertEnv(res)) return;
+  const channelsParam = req.query.channels;
+  if (!channelsParam) {
+    res.status(400).json({ error: 'channels クエリパラメータが必要です（カンマ区切りのチャンネルID）' });
+    return;
+  }
+  const channelIds = [...new Set(String(channelsParam).split(',').map((c) => c.trim()).filter(Boolean))];
+  try {
+    const uid = await getSelfUserId();
+    const results = {};
+    await mapWithConcurrency(channelIds, FETCH_CONCURRENCY, async (channelId) => {
+      try {
+        const json = await slackApi('conversations.history', { channel: channelId, limit: '1' }, true);
+        const last = (json.messages || [])[0];
+        results[channelId] = last
+          ? { userId: last.user || null, ts: last.ts, isSelf: last.user === uid }
+          : { userId: null, ts: null, isSelf: false };
+      } catch (e) {
+        results[channelId] = { error: e.message };
+      }
+    });
+    res.json({ results });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'fj-slack-backend' }));
 
 app.listen(PORT, () => console.log(`fj-slack-backend listening on port ${PORT}`));
