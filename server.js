@@ -9,8 +9,12 @@ const API_TOKEN = process.env.API_TOKEN;
 const SLACK_USER_TOKEN = process.env.SLACK_USER_TOKEN;
 const HISTORY_PER_CHANNEL = Number(process.env.HISTORY_PER_CHANNEL || 20);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 30_000);
+const CHANNEL_LIST_TTL_MS = Number(process.env.CHANNEL_LIST_TTL_MS || 5 * 60_000);
+const FETCH_CONCURRENCY = Number(process.env.SLACK_FETCH_CONCURRENCY || 8);
 
-let cache = { at: 0, data: null };
+let messageCache = { at: 0, data: null };
+let channelListCache = { at: 0, data: null };
+const userNameCache = new Map();
 let selfUserId = null;
 
 function checkAuth(req, res) {
@@ -31,7 +35,21 @@ function assertEnv(res) {
   return true;
 }
 
-async function slackApi(method, params = {}, useGet = false) {
+// 複数チャンネル/ユーザーへの問い合わせを、指定件数だけ同時実行する（Slackのレート制限を考慮した並列化）
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let idx = 0;
+  async function worker() {
+    while (idx < items.length) {
+      const cur = idx++;
+      results[cur] = await fn(items[cur], cur);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function slackApi(method, params = {}, useGet = false, retried = false) {
   const url = new URL(`https://slack.com/api/${method}`);
   let res;
   if (useGet) {
@@ -48,6 +66,12 @@ async function slackApi(method, params = {}, useGet = false) {
       },
       body: new URLSearchParams(params),
     });
+  }
+  // Slackのレート制限（429）は一度だけ待って再試行する
+  if (res.status === 429 && !retried) {
+    const wait = Number(res.headers.get('retry-after') || 1);
+    await new Promise((r) => setTimeout(r, wait * 1000));
+    return slackApi(method, params, useGet, true);
   }
   const json = await res.json();
   if (!json.ok) {
@@ -76,6 +100,20 @@ async function listAllConversations(types) {
   return channels;
 }
 
+// チャンネル一覧は頻繁には変わらないため、メッセージ本体より長いTTLで別キャッシュする
+async function getConversationLists() {
+  const now = Date.now();
+  if (channelListCache.data && now - channelListCache.at < CHANNEL_LIST_TTL_MS) {
+    return channelListCache.data;
+  }
+  const [publicPrivate, ims] = await Promise.all([
+    listAllConversations('public_channel,private_channel,mpim'),
+    listAllConversations('im'),
+  ]);
+  channelListCache = { at: now, data: { publicPrivate, ims } };
+  return channelListCache.data;
+}
+
 async function fetchHistory(channelId) {
   const json = await slackApi(
     'conversations.history',
@@ -90,74 +128,77 @@ function channelLabel(ch) {
   return ch.name ? `#${ch.name}` : ch.id;
 }
 
+// ユーザー名は変わらない前提でプロセス内に永続キャッシュ（毎回引き直さない）
+async function resolveUserName(userId) {
+  if (userNameCache.has(userId)) return userNameCache.get(userId);
+  try {
+    const json = await slackApi('users.info', { user: userId }, true);
+    const name = json.user?.real_name || json.user?.name || userId;
+    userNameCache.set(userId, name);
+    return name;
+  } catch (e) {
+    userNameCache.set(userId, userId);
+    return userId;
+  }
+}
+
 async function collectMessages() {
   const uid = await getSelfUserId();
+  const { publicPrivate, ims } = await getConversationLists();
+  const memberChannels = publicPrivate.filter((ch) => ch.is_member);
 
-  const [publicPrivate, ims] = await Promise.all([
-    listAllConversations('public_channel,private_channel,mpim'),
-    listAllConversations('im'),
-  ]);
-
-  const mentionResults = [];
-  for (const ch of publicPrivate) {
-    if (!ch.is_member) continue;
-    try {
-      const msgs = await fetchHistory(ch.id);
-      for (const m of msgs) {
-        if (m.type !== 'message' || m.subtype) continue;
-        if (m.user === uid) continue;
-        if (typeof m.text === 'string' && m.text.includes(`<@${uid}>`)) {
-          mentionResults.push({
+  const [mentionLists, dmLists] = await Promise.all([
+    mapWithConcurrency(memberChannels, FETCH_CONCURRENCY, async (ch) => {
+      try {
+        const msgs = await fetchHistory(ch.id);
+        return msgs
+          .filter(
+            (m) =>
+              m.type === 'message' &&
+              !m.subtype &&
+              m.user !== uid &&
+              typeof m.text === 'string' &&
+              m.text.includes(`<@${uid}>`)
+          )
+          .map((m) => ({
             kind: 'mention',
             channel: ch.id,
             channelLabel: channelLabel(ch),
             userId: m.user,
             text: m.text,
             ts: m.ts,
-          });
-        }
+          }));
+      } catch (e) {
+        // 個別チャンネルの取得失敗（権限不足等）はスキップして続行
+        return [];
       }
-    } catch (e) {
-      // 個別チャンネルの取得失敗（権限不足等）はスキップして続行
-    }
-  }
-
-  const dmResults = [];
-  for (const ch of ims) {
-    try {
-      const msgs = await fetchHistory(ch.id);
-      for (const m of msgs) {
-        if (m.type !== 'message' || m.subtype) continue;
-        if (m.user === uid) continue;
-        dmResults.push({
-          kind: 'dm',
-          channel: ch.id,
-          channelLabel: channelLabel(ch),
-          userId: m.user,
-          text: m.text || '',
-          ts: m.ts,
-        });
+    }),
+    mapWithConcurrency(ims, FETCH_CONCURRENCY, async (ch) => {
+      try {
+        const msgs = await fetchHistory(ch.id);
+        return msgs
+          .filter((m) => m.type === 'message' && !m.subtype && m.user !== uid)
+          .map((m) => ({
+            kind: 'dm',
+            channel: ch.id,
+            channelLabel: channelLabel(ch),
+            userId: m.user,
+            text: m.text || '',
+            ts: m.ts,
+          }));
+      } catch (e) {
+        return [];
       }
-    } catch (e) {
-      // skip
-    }
-  }
+    }),
+  ]);
 
-  const all = [...mentionResults, ...dmResults];
+  const all = [...mentionLists.flat(), ...dmLists.flat()];
 
   const userIds = [...new Set(all.map((m) => m.userId).filter(Boolean))];
-  const nameMap = {};
-  for (const id of userIds) {
-    try {
-      const json = await slackApi('users.info', { user: id }, true);
-      nameMap[id] = json.user?.real_name || json.user?.name || id;
-    } catch (e) {
-      nameMap[id] = id;
-    }
-  }
+  await mapWithConcurrency(userIds, FETCH_CONCURRENCY, resolveUserName);
 
   return all
-    .map((m) => ({ ...m, fromName: nameMap[m.userId] || m.userId }))
+    .map((m) => ({ ...m, fromName: userNameCache.get(m.userId) || m.userId }))
     .sort((a, b) => Number(b.ts) - Number(a.ts));
 }
 
@@ -167,10 +208,10 @@ app.get('/messages', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 100);
   try {
     const now = Date.now();
-    if (!cache.data || now - cache.at > CACHE_TTL_MS) {
-      cache = { at: now, data: await collectMessages() };
+    if (!messageCache.data || now - messageCache.at > CACHE_TTL_MS) {
+      messageCache = { at: now, data: await collectMessages() };
     }
-    res.json({ messages: cache.data.slice(0, limit) });
+    res.json({ messages: messageCache.data.slice(0, limit) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
